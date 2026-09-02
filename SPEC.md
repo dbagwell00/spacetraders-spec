@@ -350,7 +350,7 @@ by the worker).
 | fuel | Fuel | Fuel tank | See Fuel |
 | cooldown | Cooldown \| null | Active cooldown, if any | Null when none |
 | status | enum | Coarse execution state | `idle` / `idle_wait` / `executing` / `transit` |
-| current_event | string \| null | Label of the order being executed | Null when idle |
+| current_event | string \| null | label of the order being executed | Null when idle |
 | owner | string \| null | Controller that owns the current order | Null = unowned, freely claimable |
 | phase | enum | Plan phase | `HOLDING` / `RUNNING` |
 | version | integer | Monotonic write counter | Bumped on every applied write; backs optimistic concurrency |
@@ -4266,12 +4266,469 @@ agreement.
 
 ### 4.4 Key-Value Cache
 
-_Route manifests (atomic claiming with TTL), coordinate cache, tuned TTLs._
+The hot data path in front of the relational store and the game REST client
+has **two tiers with different storage**, and they are not interchangeable.
+The **route/claim/coordination tier** lives in a **shared external key-value
+store** — a system the agent is a **client of** — so it is a distributed/shared
+tier, not in-process memory. The **transport read cache** is the opposite: an
+**in-process** cache that exists only inside one agent process. Two tiers sit
+on this path:
+
+1. **A route/claim/coordinate tier in a shared external key-value store** —
+   holds the route manifest and the system-coordinate lookups; the agent is a
+   client of that store (§4.4.1, §4.4.3). Because it is shared, a generation
+   reset removes its route/claim/coord keys on the store side (the client
+   deletes the keys it owns), and that deletion is visible to every client of
+   the store — not just to the resetting process.
+2. **A transport read cache, in-process** — an in-process read cache in front
+   of the game REST client, existing only inside this process (§4.4.2). A
+   generation reset flushes it **locally**, so it affects only this process's
+   own cache, not any other.
+
+Both tiers are **cache-aside**: a read misses to the origin (the store or the
+REST client) and is then cached; a write updates the origin and busts the
+dependent reads.
+
+#### 4.4.1 Route manifest — atomic claiming
+
+- **Shape** — the manifest is an ordered set of route records, each carrying a
+  stable digest of the route and a **value score** (profit per second). It is
+  replaced wholesale on each update; it is never incrementally patched.
+- **Claim** — a ship **claims** a route by writing a claim record for that
+  route's digest. The claim is **atomic** and carries a **TTL**, so a claim
+  auto-expires if the claiming ship dies mid-route. A claim is released
+  explicitly on completion, or falls off by expiry — either way the route
+  returns to the pool of **unclaimed** routes.
+- **Ranking** — the pool of unclaimed routes is served ranked **by value,
+  highest first**; a route with a live claim is filtered out of that ranking.
+
+#### 4.4.2 Transport read cache (in front of the game REST client)
+
+- **Cacheable vs always-live** — only idempotent reads of a resource that
+  passes no body are cacheable; **a mutation is never cacheable**. Reads that
+  depend on mutable, per-call state are treated as **always-live** and bypass
+  the cache.
+- **Keying** — the **composite key** is the path **and** the query params,
+  sorted and serialized. This makes entries **per-page**: two different pages
+  of the same list are two entries, and identical requests collapse onto one.
+- **Singleflight** — when several concurrent requests hit the same cold key,
+  they **collapse to a single upstream call** that they all share. Without this,
+  many ships racing to fill one market on first access would each pay a
+  rate-limit token for the same data.
+- **Per-endpoint TTL patterns** — a **TTL pattern table** maps an endpoint
+  family to a default, a **floor**, and a **ceiling**. The effective **runtime
+  TTL** for a read is a live override if one has been tuned, else the pattern
+  default; a path with no pattern falls back to a short global default.
+- **Tuned at runtime** — a slow background pass observes how long responses
+  stay unchanged and **tunes** the live TTLs, EMA-smoothed and clamped to each
+  pattern's floor/ceiling, writing the result back into a small live overlay
+  the client polls. It never blocks the hot path.
+- **Invalidation on write** — the cache-aside **invalidation**: after a
+  mutation, the cache **busts** the dependent reads (the exact key and its
+  per-page variants) so the next read goes live, rather than trusting a stale
+  entry.
+
+#### 4.4.3 Coordinate cache
+
+- **Shape** — a simple map of system → coordinates, giving **O(1)** lookup.
+- **Stability** — it is cheap and stable, written in bulk when systems are
+  charted; coordinates rarely change, so the entries live long.
+- **Reset** — a generation reset **flushes** it (with the route manifest and
+  the claims) so the new generation starts from a clean slate.
 
 ### 4.5 Control API
 
-_Live-state and control endpoints served by the agent process._
+A **control API** is a local surface **served by the agent process on its own
+port, in-process** — the same process that runs the planner and the worker
+pool. It is **a separate plane from the game REST API**: it is **not
+rate-limited by the API budget**, draws no game-API tokens, and never counts
+against the shared rate limiter. Its whole reason for existing is to expose
+the one thing only this process can answer: live in-memory state and the
+operator commands that mutate it.
+
+#### 4.5.1 Two endpoint families
+
+- **Live-state reads** — expose **in-memory state no external store holds**:
+  the priority-**limiter counters**, the shared **planner state**, the
+  **scheduler queue**, plus gauges (market freshness, pool admission). These
+  answer from the process's own memory; a query to a database would invent
+  nothing, because the state lives only here.
+- **Control / mutation commands** — the levers a human **operator** pulls:
+  **pause/resume** (one ship or the whole fleet), **halt** and **unhalt**,
+  **cancel** an order, **navigate**, **scrap**, set a ship **role**, queue a
+  fleet **purchase**, set per-system targets, and change **config**.
+
+#### 4.5.2 Auth, shape, and failure
+
+- **Shape** — JSON request/response; a small set of named commands, each
+  taking a compact JSON body and answering a compact result.
+- **Auth / scope** — there is **NO in-app auth/credential**: the surface
+  carries no token, no per-client secret, and no credential check. It is a
+  local, **operator-facing** control plane served on the agent's own port and
+  reached in practice through a **cross-process dashboard proxy**; any
+  protection sits at the **transport/network boundary**, outside this app.
+  It is not a per-client, multi-tenant model.
+- **Fails safe** — when the live wiring has not **arrived** (the planner or
+  client reference is not attached yet), the surface answers **503** — it does
+  **not** pretend the command succeeded and it is not mistaken for a network
+  fault by a proxy on the far side.
+
+#### 4.5.3 The running config is live, then persisted
+
+A config change **mutates the live running config object in this process**
+immediately (so the running system acts on it this tick), and then **persists
+an override** to the store so it survives a restart. Reading the config
+returns the live value and whether it is an override; resetting clears the
+override. The mutation is in-process and immediate — this is **not** a
+persist-then-restart path.
+
+#### 4.5.4 Telemetry / gauges
+
+The surface also serves **telemetry**: a **snapshot** of the limiter and
+cache state, **market freshness**, and **pool admission** — counters scoped
+to a **per-window** cadence, plus the head-of-line age of any priority queue,
+so a rising wait is visible before it starves trade execution.
 
 ### 4.6 Simulation Harness
 
-_Mocked API client, calibrated market mechanics, seeders, A/B methodology._
+The **simulation harness** is a **test double** at the **API boundary**: a
+**mocked API client** stands in for the live game API so the **production
+planner and worker run unchanged** against a synthetic or historical world,
+**with no network**. It exists to answer operational and research questions
+("how many API calls to complete the gate?", "what capital supports expansion
+to a new ring?", "does this change preserve the X invariant?") and to validate
+crash recovery — **not** to be a second production path. Every algorithm
+tested in the harness is the **same code** that runs live; the only things
+that are faked are the world, the clock, and the external systems.
+
+The four pillars, and the guarantee a re-implementer must keep for each:
+
+| Pillar | What it is | Guarantee that must hold |
+|---|---|---|
+| Mocked API client | a drop-in seam at the API boundary | same request/response contract, same typed preconditions raised |
+| Market mechanics | a calibrated AMM price model + recovery + competitor activity | deterministic per seed; matches the measured price walks |
+| World seeders | deterministic builders of agent, ships, markets, waypoints, systems, contracts | pure over a fixed seed and time anchor, so bit-reproducible |
+| A/B methodology | two configs on the same seeded world | one variable changed at a time; compare the settled outcomes |
+
+#### 4.6.1 The mocked client is a drop-in at the API boundary
+
+The **mocked client** is a **seam at the API boundary**: it presents the
+**same request/response contract** as the live API and raises the **same
+typed preconditions** — a ship already in transit, a cooldown still running,
+insufficient funds, a market or gate not found, an over-traded volume — so the
+production retry logic is exercised naturally rather than stubbed out. It reads
+from and mutates an in-memory **world** (the source of truth the API would
+return), and it schedules arrival, cooldown, and restock events on the
+**virtual clock** instead of waiting on real seconds.
+
+Three external dependencies are stubbed so the production code paths run
+against them unchanged:
+
+- the **relational store** — every write is a no-op and every read returns an
+  empty or plausibly-shaped default; the agent's state is seeded directly, so
+  the loaders only cover the empty-store fallback path.
+- the **key-value cache** — route manifests evaporate and coordinate lookups
+  always miss, because routes are recomputed each tick and coordinates are
+  read straight from the world.
+- the **time source** — the real clock is replaced by a **manually advanced
+  virtual clock**, so cooldowns and transit are modelled by the world raising
+  its typed preconditions against the virtual time, not by sleeping.
+
+The full **planner → scheduler → worker → step engine** stack is wired against
+this mocked client exactly as it is in production; the harness simply steps the
+virtual clock forward, runs one planner cycle, drains the scheduler's pending
+events (so the worker handlers actually run), and repeats until a stop
+condition or the run's time bound. Because the code is **unchanged**, a defect
+the harness surfaces is a defect in production, and a fix is proven offline
+before it is ever pointed at the live API.
+
+#### 4.6.2 Calibrated market mechanics
+
+Price is the load-bearing mechanic, so the harness models it faithfully rather
+than as a flat table:
+
+- **AMM price model.** Each **buy or sell** **walks the price** of the affected
+  good by a **per-unit** fraction of its current price, set by the good's
+  **supply tier** and **market activity**: the **softest** walk is for the most
+  scarce listing (the price sits near its ceiling, so each marginal unit moves
+  it least) and the **hardest** for a moderate one, while active markets walk
+  several times harder than quiet ones. The trade is applied **batch by batch**
+  at the good's **trade volume** and re-quoted, mirroring how the game actually
+  charges. These fractions are **calibrated to measured trade data** (fit to a
+  large corpus of real, labeled trades), not hand-tuned.
+- **Supply re-derived, not frozen.** After a walk the good's **supply tier is
+  re-derived** from the new price relative to its **equilibrium price** (the
+  universal price-band thresholds). This is load-bearing: without it the tier
+  stays frozen at its seed value and every tier-gated decision the planner
+  makes (defer on a scarce input, recover from a stressed chain) is a
+  measurement no-op.
+- **Recovery is discrete, not continuous.** Prices **do not** drift back to
+  rest as a smooth exponential. Instead each market evolves on a **discrete
+  restock tick** (on the order of half an hour, not phase-aligned to a global
+  grid) that moves the price toward its **rest state** by a **quantum
+  proportional to the good's trade volume** — an inventory restock, constant in
+  units. This bound is what makes factory output and **gate-build timing**
+  live-comparable; a continuous model implies an impossible recovery rate and a
+  gate that builds far too fast.
+- **Competitor activity** is modelled either as a **deterministic replay** of
+  recorded competitor fills or as a **stochastic arrival process**; both drive
+  the **same price model**, so the agent and its competitors see identical
+  price dynamics. The replay form is the one used to validate against real
+  history.
+
+#### 4.6.3 Deterministic world seeders
+
+A **seeder** is a pure builder that returns a fully-formed in-memory **world**
+for a given seed: the **agent**, its **ships** (frame, engine speed, fuel,
+cargo, mounts), the **markets** (each good's price, trade volume, supply tier,
+activity, and import/export/exchange role), the **waypoints** and **systems**
+(the jump-gate topology), any **contracts** and **surveys** in flight, and the
+shipyard listings. The three seeder sources are:
+
+- **synthetic (parametric)** — a generated galaxy sized by dials (number of
+  systems, gate density, the fraction of uncharted waypoints, markets per
+  system). Topology is drawn with a spatial process, connected into a
+  guaranteed-connected graph, then extra edges are added to branch it out; every
+  marketplace sells fuel so no ship can strand. Used to target edge cases
+  without hand-crafted fixtures.
+- **a live snapshot** — the exact state of a real reset reconstructed at a
+  chosen timestamp (ships, markets, prices, contracts): the baseline for "run
+  the production planner from a real starting point".
+- **a historical replay** — the market state reconstructed just before a
+  specific recorded trade, for replay-validation of the price model.
+
+**Determinism is the contract.** A **fixed random seed** and a **fixed time
+anchor** make a given seed **bit-reproducible**: the same seed yields the same
+world, the same event ordering, and the same price walks, run after run. This
+is why the seeder must be pure over its inputs, and why the harness pins both
+the seed and the anchor rather than reading the real clock.
+
+#### 4.6.4 A/B methodology on a seeded world
+
+An **experiment** runs **two configs on the same seeded world** — the same
+seed, the same time anchor, everything else held fixed — and changes **one
+variable at a time** (a config knob, a controller posture, a fleet template).
+Because each arm is **seed-deterministic**, the outcome delta is attributable
+to that single change rather than to run-to-run noise.
+
+The outcomes compared on the settled run are **credits**, **fleet** (count and
+composition), **contracts** and **units delivered**, **API calls** (total, and
+by method or by the order-purpose that issued them), and **milestone timing**
+(when the gate or a target was reached). Because a single run carries a small
+amount of noise, results are read on **seed-paired, settled** runs and compared
+as **bands**, not point estimates. A **replay-validation** pass scores the
+price model against recorded observations (per-good error statistics) and is
+the **baseline to beat**: no pricing or algorithm change may do worse on those
+numbers than the current mechanics.
+
+Where the harness is **calibrated to be faithful** and where it is **not** is a
+deliberate line a re-implementer must respect: it is quantitatively faithful on
+**throughput and timing** (does the input stay scarce, does the pump stay
+within its loss cap, when does the gate complete) but **not** on absolute
+credit or fleet magnitude (the model executes every clearing trade, whereas
+live haulers park and run at a realized fraction). So a harness number is a
+valid A/B and a valid invariant regression, but **not a live prediction of
+absolute credits**.
+
+#### 4.6.5 What it is for — a test double, not a second path
+
+The harness is a **test double** that serves three jobs, all of which are
+impossible or too expensive against the live API:
+
+- **Regression of invariants.** Run the production planner/worker against a
+  known world and assert the invariants the earlier sections define (no
+  double-spend, claims released, credit reservations balanced, rate budget
+  respected). A change that breaks an invariant shows up offline,
+  deterministically.
+- **Crash recovery via fault injection.** Kill the run mid-step and restart it
+  against the persisted state, then assert the **§3.4b** guarantee: the
+  in-flight step is not re-acted, the order is not double-spent, and a
+  superseded order is abandoned. The harness makes this repeatable on a fixed
+  seed, so the at-least-once-delivery → no-second-effect argument can be
+  exercised end to end.
+- **Calibrating the rate limit and backoff.** With the API made **bounded** at
+  a synthetic calls/second ceiling, the realized request rate converges to the
+  budget and the §4.2 429 penalty / retry behaviour can be measured offline.
+
+It is **not a second production path**: the planner, worker, scheduler, step
+engine, and price model are the **same** code; only the world, the clock, the
+store, and the cache are synthetic. And it is **not a live predictor** — it is
+calibrated for throughput and timing, so its absolute numbers must never be
+read as a forecast. A re-implementer should build the harness as exactly this:
+one seam, faithful mechanics, deterministic seeds, and a controlled A/B
+comparison — and treat any result as a relative, offline one.
+
+## 5. Concurrency Model
+
+This section names *how* the system runs and stays correct when many pieces
+act at once. §3 specifies what each routine does; this section specifies the
+execution model, the shared-state access rules, which updates are atomic and
+which are eventually consistent, the optimistic-concurrency guards, and crash
+recovery. It is the concurrency-side companion to §4.3's durability boundary
+and to the ownership substrate in §2.3.
+
+```mermaid
+flowchart TD
+    E["one event loop<br/>(no threads)"]
+    P["planner tick<br/>(coroutine)"]
+    W["worker pool<br/>(coroutines)"]
+    R["lock-free reads"]
+    C["credit gate<br/>(exclusive)"]
+    S["ship-write door<br/>(one write per ship)"]
+    E --> P
+    E --> W
+    P --> R
+    W --> R
+    P --> C
+    W --> C
+    W --> S
+```
+
+**Figure 5.1 — Concurrency model.** One event loop hosts every component as a
+cooperative coroutine (no threads). Reads of shared state are lock-free; the
+credit gate is the one exclusive path; per-ship writes funnel through the
+ship-write door and bump the ship's version. The optimistic guards (claim/
+lease, version, generation) and crash recovery close the races this topology
+leaves open.
+
+### 5.1 Execution model — one loop, cooperative
+
+The system runs on a **single event loop with no threads**: there is no
+OS-level or hardware parallelism, and no two components execute
+simultaneously. The **planner tick** and the **worker pool** are **coroutines
+on that one loop**, scheduled cooperatively — a coroutine runs until it reaches
+a **suspension point** (a wait for an I/O operation on the API, the cache,
+or the store) and then
+yields; the loop runs another coroutine until it suspends too. So two
+coroutines are *concurrent but not parallel*: they **interleave at suspension
+points**, never execute at the same instant.
+
+This is the whole concurrency model: correctness never comes from
+synchronization hardware or thread isolation, but from two rules. First,
+access to shared state is governed by **ownership** and a single **exclusive
+gate** (§5.2). Second, every race that ownership cannot exclude is closed by an
+**optimistic** guard that detects a lost update after the fact rather than
+blocking before it (§5.4). A re-implementation in any language gets this model
+by giving every component its own coroutine on one scheduler and forbidding
+worker threads; the exact runtime is incidental.
+
+### 5.2 Shared-state access — the single source of truth
+
+**GameState** is the **single shared source of truth**: every component reads
+and writes the one in-memory state, so there is no copy to keep in sync and no
+second truth to reconcile against (write-through durability is §4.3). Within
+that one state, access is split by **ownership**:
+
+- **Lock-free reads.** The fast path. Any component reads any slice of the
+  state without a lock, because on a single loop a read is atomic with respect
+  to the loop — no writer can interleave into the middle of one. Readers never
+  block, and a reader never takes a write lock, so observation of shared state
+  costs nothing and cannot deadlock.
+- **The exclusive gate — credit.** The agent's **credit (funds)** is the one
+  slice of shared state whose *mutation* must be **exclusive**: all credit
+  reads-and-writes go through a single **credit gate** (one lock in the shared
+  state) held for the duration of the **check-and-reserve**. This is the
+  minimal exclusive path: only the money is serialized, because only the money
+  has the "no double-spend" invariant.
+- **Ownership of every other slice.** Each other slice has exactly **one
+  owner** — the §2.3 *ship-write door* for per-ship volatile state, the
+  *reservation door* for the credit reservations, the owning controller for its
+  conditions — so each of those slices has a **single owner** and needs no
+  lock: with one owner there is no write/write race, and the single loop makes
+  any read safe.
+
+The rule: **reads are always lock-free; only the credit slice is exclusive;
+every other slice has one owner.** A re-implementer should never introduce a
+general read lock or a lock per field — that would serialize the fast path and
+recreate a race the ownership model already excludes.
+
+### 5.3 Atomic vs. eventually consistent
+
+Two kinds of update coexist, and the spec draws the line the same way on both
+the **concurrency** side (this section) and the **durability** side (§4.3,
+*The atomic / eventually-consistent boundary*):
+
+- **Atomic — the credit check-and-reserve.** A read of available credit and the
+  reservation against it are one **exclusive, indivisible** operation at the
+  credit gate, so no second coroutine can read the same balance and reserve it.
+  A **single** write to one slice or one store relation is likewise atomic: it
+  lands whole or not at all. This is the only write path a re-implementation
+  may rely on to be **exactly-once**.
+- **Eventually consistent — everything else.** A **multi-relation update** (a
+  planner decision, then the ship state, then a sample) is *not* one
+  transaction; each leg is atomic on its own and the legs **converge by
+  reconciliation** on the next tick. And the **in-memory** state **leads**
+  while the **durable store follows by write-through**, so the two may disagree
+  for the span of one tick: the memory is current, the store is a step behind,
+  and they **converge** as writes are flushed. No correctness property depends
+  on that lag closing in a fixed order or within a fixed time.
+
+**Why the split.** The invariant that must never break is *the agent can never
+spend money it does not have* — a money path, so it is **atomic** at the
+credit gate. Everything else (a market price, a route claim, a derived
+classification) is **informational**: it may be a tick stale and a reconcile
+will fix it, so it is held **eventually consistent** to keep the fast path
+lock-free. The boundary is thus: **atomic where a money invariant lives;
+eventually consistent everywhere else.**
+
+### 5.4 Optimistic concurrency — the lost-update guard
+
+Ownership and one loop exclude write/write races, but three races remain and
+each is closed **optimistically** — no writer blocks on another; a stale write
+is simply **discarded** when the guard notices it:
+
+- **Per-ship version.** Every applied write to a ship bumps its **version**,
+  including a **same-value** write, because the question a reader asks is "did
+  anything change since I last looked," not "did the value differ." A decision
+  computed against a ship whose version has since moved is **stale** and is
+  re-evaluated, not applied.
+- **Generation vs. observed generation.** A ship's **generation** bumps when
+  its **intent (order)** changes; the **worker** stamps
+  **observed_generation** when it begins executing. `observed < generation`
+  means the order never reached the worker — an assignment that never arrived.
+  It is a staleness signal on the *intent*, the twin of the version signal on
+  the *state* (see §2.4).
+- **Claim / lease (compare-and-set).** A scarce target — a route, a system, a
+  ship — is claimed with a **compare-and-set / set-if-absent** that succeeds
+  only if no claim exists, and carries a **TTL** so it **expires** on its own
+  (so a dead claimant is not waited on forever). **Exactly one claimant wins**;
+  a **loser** retries later or picks another target. The TTL is what makes the
+  claim safe across a crash instead of a deadlock.
+
+These are the **lost-update guards**: the version and generation catch a
+stale *reader* (a decision against an old state), and the claim/lease catches a
+stale *writer* (two actors trying to own one target). All three are **atomic
+compare-and-set primitives**, so no coroutine is ever held up waiting for
+another, and no writer is ever silently overwritten.
+
+### 5.5 Crash recovery — what survives, and how boot rehydrates
+
+A crash destroys everything **in-memory**; the only things that **survive the
+crash** are the **durable store** and the **shared coordination cache**. Boot
+therefore **rebuilds** the in-memory state from those two, and it does so in a
+way that guarantees no effect is lost and none is repeated:
+
+- **Rehydrate to executing.** A ship that was **in-flight** (mid step sequence
+  when the process died) is restored to **executing** at boot: its **current
+  order** and **step index** are loaded from the durable store and the
+  sequence **resumes at the step it left**, not from the top.
+- **No double-act.** Steps whose **external effect already landed** before the
+  crash (a buy that went through, a delivered contract) are **skipped on
+  resume** — they are **not re-acted** — so the effect **fires at most once**
+  across the crash, even though nothing was held in a transaction. This is the
+  **no double-spend / no double-act** guarantee.
+- **Superseded orders are abandoned.** Only a ship's **current** order is
+  resumed. An in-flight order that was **superseded** by a newer one before the
+  crash is **abandoned at boot** and its remaining steps are **not executed** —
+  only the newest order runs.
+- **At-least-once, effects once.** Work is delivered **at least once**: an
+  event is removed from the store only **after its handler completes**, so a
+  crash mid-handler causes the event to be **re-delivered** on the next boot.
+  It is the effect guards in the two bullets above (skip what already landed,
+  abandon what is superseded) that turn **at-least-once delivery** into
+  **effectively-once effects** — the same argument §3.4b relies on, stated
+  here as the recovery invariant.
+
+The net result a re-implementation must reproduce: a crash costs at most a
+replay of *already-completed* bookkeeping; it can neither lose a committed
+effect nor apply the same external effect twice.
