@@ -83,10 +83,14 @@ is market coverage.
   reference: claim protocol, generation guard, reservation door, the dual-bucket
   limiter, write-through persistence, reset boundaries, one convergent move per
   probe, defer-on-transit, full-path antimatter affordability, single ownership.
-- **Jump gates are never charted.** `SPEC.md` §3.2e already forbids it —
-  charting a gate publishes the graph to rivals for nothing. TURKEYBOI1's
-  pathfinder agrees and skips gates, asteroid bases and engineered asteroids
-  explicitly. The exclusion list is policy (§2.2), the gate rule is an
+- **Jump gates ARE charted** *(corrected 2026-09-25)*. This said they never
+  are -- "charting a gate publishes the graph to rivals for nothing" -- and
+  every premise was false: a gate chart pays 10,000 credits live; a charted
+  gate answers `/jump-gate` remotely forever, an uncharted one only with a
+  ship present; 2,334 of 2,746 known gates were already charted by others
+  (reset 2026-09-20); whater's relay counts charted gates, and TURKEYBOI1's
+  own config calls its gate exclusion a reversible doctrine while its arrival
+  reflex charts gates anyway. Exclusions are policy (§2.2); there is no gate
   invariant.
 - The **rate limit is the binding resource**, not credits and not hulls. Every
   lane below is specified as a service level against it.
@@ -224,8 +228,8 @@ constant.
   4. dense local bundles that are efficient to finish;
   5. the remainder by expected reward against travel cost and the probability
      it is still uncharted on arrival.
-- **Exclusions are policy, and only one is an invariant.** Jump gates are never
-  charted (invariant, §0.3). Asteroid bases and engineered asteroids are
+- **Exclusions are policy, and none is an invariant.** Jump gates are charted
+  like any other ground (§0.3, corrected 2026-09-25). Asteroid bases and engineered asteroids are
   deprioritized by TURKEYBOI1 as low payout — but our own data shows plain
   `ASTEROID` waypoints paying 852k–1.1M, so asteroids as a class must not be
   excluded. Measure before excluding.
@@ -310,7 +314,8 @@ realized chart ledger (attempts, successes, already-charted, credits).
    already-charted and credits all land in the ledger. The frontier controller
    has specified the already-charted response as its only input since it was
    written and has never received one; this is the producer.
-2. **Never a jump gate** (§0.3).
+2. ~~**Never a jump gate** (§0.3).~~ Jump gates are charted (§0.3, corrected
+   2026-09-25): the chart pays, and it keeps the gate's edges queryable.
 3. **The reflex is not rationed by this controller.** A ship standing on
    uncharted ground charts it. Routing *toward* uncharted ground is this
    controller's decision; charting ground already underfoot is not a decision.
