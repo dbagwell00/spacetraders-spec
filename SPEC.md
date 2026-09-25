@@ -2143,12 +2143,16 @@ The load-bearing invariants:
   against a gate nobody is at). Conflating "asked once, learned nothing" with
   "this gate's connections are known" is a one-way door that once froze the
   reachable set at a handful of systems.
-- **Gate visits never chart the gate.** To unlock a gate that is complete but
-  not yet queryable, the owner recruits a probe already parked in that system
-  and sends a **bare navigate hop** to the gate waypoint — with **no chart
-  step**, because charting a jump gate leaks the graph to rivals for nothing
-  (a probe parked there is enough to make the gate serve its connections, and
-  the probe is free to move on afterwards).
+- **Gate visits chart the gate.** To unlock a gate that is complete but not
+  yet queryable, the owner recruits a probe already parked in that system,
+  navigates it to the gate waypoint **and charts it**. A charted gate serves
+  its connections remotely forever; an uncharted one answers only while a
+  ship stands there, so a bare visit unlocks the gate only until the probe
+  moves on. *(Corrected 2026-09-25. This rule said "no chart step, because
+  charting a jump gate leaks the graph to rivals for nothing". That was wrong:
+  a gate chart pays 10,000 credits live, 2,334 of 2,746 known gates were
+  already charted by others that reset, and whater and TURKEYBOI1 both chart
+  gates.)*
 - **The flood is self-pacing and converges to a no-op.** Each pass does bounded
   work (a cap on gate scans and a cap on systems cartographed), a per-system
   scanned set means a gate is scanned once, and it runs off the tick. Once the
